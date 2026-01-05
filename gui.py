@@ -5,17 +5,482 @@ import json
 import os
 import sys
 import time
+import re
+from datetime import datetime
+from typing import List, Dict, Optional, Callable, Any
 from bilibili_api import BilibiliAPI
 from auto_login import auto_login_setup
 
 def get_app_dir():
     """获取应用程序目录"""
     if getattr(sys, 'frozen', False):
-        # 打包后的可执行文件
         return os.path.dirname(sys.executable)
     else:
-        # 开发环境
         return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_data_dir():
+    """获取数据存储目录"""
+    data_dir = os.path.join(get_app_dir(), 'data')
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir, exist_ok=True)
+    return data_dir
+
+
+class DataManager:
+    """数据管理器 - 负责关注列表的获取、处理、存储和分发"""
+    
+    VERSION = "1.0"
+    DATA_FILENAME = "following_data.json"
+    BACKUP_PREFIX = "following_backup_"
+    
+    def __init__(self):
+        self.data_dir = get_data_dir()
+        self.data_file = os.path.join(self.data_dir, self.DATA_FILENAME)
+        self.raw_data = []
+        self.processed_data = {}
+        self.observers = {}
+        self.last_update = None
+        self.update_count = 0
+        self.load_local_data()
+    
+    def register_observer(self, name: str, callback: Callable):
+        """注册数据观察者
+        
+        Args:
+            name: 观察者名称
+            callback: 回调函数，接收更新数据
+        """
+        self.observers[name] = callback
+    
+    def unregister_observer(self, name: str):
+        """注销观察者"""
+        if name in self.observers:
+            del self.observers[name]
+    
+    def notify_observers(self, event: str, data: Any = None):
+        """通知所有观察者
+        
+        Args:
+            event: 事件类型 (data_updated, data_error, data_loading)
+            data: 事件数据
+        """
+        for name, callback in self.observers.items():
+            try:
+                callback(event, data)
+            except Exception as e:
+                print(f"[DataManager] 观察者 {name} 处理事件失败: {e}")
+    
+    def process_data(self, raw_list: List[Dict]) -> Dict:
+        """处理原始数据，提取各功能模块所需的结构化信息
+        
+        Args:
+            raw_list: 原始关注列表数据
+            
+        Returns:
+            处理后的数据结构
+        """
+        processed = {
+            'version': self.VERSION,
+            'update_time': datetime.now().isoformat(),
+            'total_count': len(raw_list),
+            'users': {},
+            'index': {
+                'by_name': {},
+                'by_uid': {},
+                'by_sign': {}
+            },
+            'statistics': {
+                'name_length_stats': {},
+                'sign_length_stats': {}
+            }
+        }
+        
+        for user in raw_list:
+            uid = str(user.get('uid', '')) or str(user.get('mid', ''))
+            uname = user.get('uname', '').strip()
+            sign = user.get('sign', '').strip() if user.get('sign') else ''
+            mtime = user.get('mtime', 0)
+            mtime_str = user.get('mtime_str', '未知')
+            
+            if not uid:
+                continue
+            
+            user_info = {
+                'uid': uid,
+                'uname': uname,
+                'sign': sign,
+                'mtime': mtime,
+                'mtime_str': mtime_str,
+                'face': user.get('face', ''),
+                'vip': user.get('vip', {}),
+                'official': user.get('official', {})
+            }
+            
+            processed['users'][uid] = user_info
+            
+            name_lower = uname.lower()
+            for i in range(1, min(len(name_lower) + 1, 20)):
+                prefix = name_lower[:i]
+                if prefix not in processed['index']['by_name']:
+                    processed['index']['by_name'][prefix] = []
+                processed['index']['by_name'][prefix].append(uid)
+            
+            uid_key = uid.lower()
+            if len(uid_key) <= 20:
+                for i in range(1, len(uid_key) + 1):
+                    prefix = uid_key[:i]
+                    if prefix not in processed['index']['by_uid']:
+                        processed['index']['by_uid'][prefix] = []
+                    processed['index']['by_uid'][prefix].append(uid)
+            
+            sign_lower = sign.lower()
+            words = re.findall(r'\b\w+\b', sign_lower)
+            unique_words = set(words)
+            for word in unique_words:
+                if len(word) >= 2:
+                    if word not in processed['index']['by_sign']:
+                        processed['index']['by_sign'][word] = []
+                    if uid not in processed['index']['by_sign'][word]:
+                        processed['index']['by_sign'][word].append(uid)
+            
+            name_len = len(uname)
+            len_bucket = f"{name_len // 10 * 10}-{(name_len // 10 + 1) * 10 - 1}"
+            if len_bucket not in processed['statistics']['name_length_stats']:
+                processed['statistics']['name_length_stats'][len_bucket] = 0
+            processed['statistics']['name_length_stats'][len_bucket] += 1
+            
+            sign_len = len(sign)
+            len_bucket = f"{sign_len // 50 * 50}-{(sign_len // 50 + 1) * 50 - 1}"
+            if len_bucket not in processed['statistics']['sign_length_stats']:
+                processed['statistics']['sign_length_stats'][len_bucket] = 0
+            processed['statistics']['sign_length_stats'][len_bucket] += 1
+        
+        processed['index']['by_name']['__total__'] = len(processed['index']['by_name'])
+        processed['index']['by_uid']['__total__'] = len(processed['index']['by_uid'])
+        processed['index']['by_sign']['__total__'] = len(processed['index']['by_sign'])
+        
+        return processed
+    
+    def save_data(self, data: Dict = None) -> bool:
+        """保存数据到文件
+        
+        Args:
+            data: 要保存的数据，如果为None则保存当前数据
+            
+        Returns:
+            是否保存成功
+        """
+        try:
+            save_data = data if data else self.processed_data
+            
+            self.create_backup()
+            
+            with open(self.data_file, 'w', encoding='utf-8') as f:
+                json.dump(save_data, f, ensure_ascii=False, indent=2)
+            
+            return True
+        except Exception as e:
+            print(f"[DataManager] 保存数据失败: {e}")
+            return False
+    
+    def create_backup(self) -> bool:
+        """创建数据备份
+        
+        Returns:
+            是否备份成功
+        """
+        try:
+            if os.path.exists(self.data_file):
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                backup_file = os.path.join(
+                    self.data_dir, 
+                    f"{self.BACKUP_PREFIX}{timestamp}.json"
+                )
+                
+                with open(self.data_file, 'r', encoding='utf-8') as src:
+                    with open(backup_file, 'w', encoding='utf-8') as dst:
+                        dst.write(src.read())
+                
+                self.cleanup_old_backups(max_keep=5)
+                return True
+            return False
+        except Exception as e:
+            print(f"[DataManager] 创建备份失败: {e}")
+            return False
+    
+    def cleanup_old_backups(self, max_keep: int = 5):
+        """清理旧备份文件
+        
+        Args:
+            max_keep: 保留的最大备份数量
+        """
+        try:
+            backup_files = []
+            for f in os.listdir(self.data_dir):
+                if f.startswith(self.BACKUP_PREFIX) and f.endswith('.json'):
+                    filepath = os.path.join(self.data_dir, f)
+                    backup_files.append((filepath, os.path.getmtime(filepath)))
+            
+            backup_files.sort(key=lambda x: x[1], reverse=True)
+            
+            for filepath, _ in backup_files[max_keep:]:
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+        except Exception as e:
+            print(f"[DataManager] 清理旧备份失败: {e}")
+    
+    def load_local_data(self) -> bool:
+        """加载本地保存的数据
+        
+        Returns:
+            是否加载成功
+        """
+        try:
+            if os.path.exists(self.data_file):
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    self.processed_data = json.load(f)
+                
+                self.raw_data = self.extract_raw_data()
+                self.last_update = self.processed_data.get('update_time', '')
+                self.update_count = self.processed_data.get('total_count', 0)
+                return True
+            return False
+        except Exception as e:
+            print(f"[DataManager] 加载本地数据失败: {e}")
+            self.processed_data = {}
+            self.raw_data = []
+            return False
+    
+    def extract_raw_data(self) -> List[Dict]:
+        """从处理后的数据中提取原始用户列表
+        
+        Returns:
+            原始用户数据列表
+        """
+        if not self.processed_data:
+            return []
+        
+        users = self.processed_data.get('users', {})
+        return list(users.values())
+    
+    def get_user_by_uid(self, uid: str) -> Optional[Dict]:
+        """根据UID获取用户信息
+        
+        Args:
+            uid: 用户ID
+            
+        Returns:
+            用户信息字典，不存在返回None
+        """
+        return self.processed_data.get('users', {}).get(str(uid))
+    
+    def search_index(self, keyword: str, search_type: str = 'name') -> List[str]:
+        """使用索引快速搜索
+        
+        Args:
+            keyword: 搜索关键词
+            search_type: 搜索类型 (name, uid, sign)
+            
+        Returns:
+            匹配的UID列表
+        """
+        keyword = keyword.lower().strip()
+        index = self.processed_data.get('index', {}).get(f'by_{search_type}', {})
+        
+        if search_type == 'uid':
+            if keyword in index:
+                return index[keyword]
+            results = []
+            for prefix, uids in index.items():
+                if prefix != '__total__' and keyword in prefix:
+                    results.extend(uids)
+            return list(set(results))
+        else:
+            return index.get(keyword, [])
+    
+    def get_statistics(self) -> Dict:
+        """获取数据统计信息
+        
+        Returns:
+            统计数据字典
+        """
+        return {
+            'total_users': self.processed_data.get('total_count', 0),
+            'last_update': self.last_update,
+            'index_stats': {
+                'name_prefixes': self.processed_data.get('index', {}).get('by_name', {}).get('__total__', 0),
+                'uid_prefixes': self.processed_data.get('index', {}).get('by_uid', {}).get('__total__', 0),
+                'sign_words': self.processed_data.get('index', {}).get('by_sign', {}).get('__total__', 0)
+            },
+            'name_length_dist': self.processed_data.get('statistics', {}).get('name_length_stats', {}),
+            'sign_length_dist': self.processed_data.get('statistics', {}).get('sign_length_stats', {})
+        }
+    
+    def save_following_list(self, following_list: List[Dict]) -> bool:
+        """保存关注列表（用于批量操作后同步）
+        
+        Args:
+            following_list: 关注用户列表
+            
+        Returns:
+            是否保存成功
+        """
+        try:
+            processed = self.process_data(following_list)
+            return self.save_data(processed)
+        except Exception as e:
+            print(f"[DataManager] 保存关注列表失败: {e}")
+            return False
+    
+    def clear_data(self):
+        """清空所有数据"""
+        try:
+            self.raw_data = []
+            self.processed_data = {}
+            self.last_update = None
+            self.update_count = 0
+            
+            if os.path.exists(self.data_file):
+                os.remove(self.data_file)
+            
+            self.notify_observers('data_cleared', None)
+            print("[DataManager] 数据已清空")
+        except Exception as e:
+            print(f"[DataManager] 清空数据失败: {e}")
+
+
+class SearchService:
+    """搜索服务类，提供高效的搜索功能"""
+    
+    def __init__(self):
+        self.data = []
+        self.search_history = []
+        self.history_file = os.path.join(get_app_dir(), 'search_history.json')
+        self.load_history()
+    
+    def set_data(self, data_list):
+        """设置搜索数据"""
+        self.data = data_list
+    
+    def load_history(self):
+        """加载搜索历史"""
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    self.search_history = json.load(f)
+        except:
+            self.search_history = []
+    
+    def save_history(self):
+        """保存搜索历史"""
+        try:
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.search_history[-50:], f, ensure_ascii=False)
+        except:
+            pass
+    
+    def add_to_history(self, query):
+        """添加搜索词到历史"""
+        if query and query.strip():
+            query = query.strip()
+            if query in self.search_history:
+                self.search_history.remove(query)
+            self.search_history.insert(0, query)
+            self.save_history()
+    
+    def get_history(self, limit=10):
+        """获取搜索历史"""
+        return self.search_history[:limit]
+    
+    def clear_history(self):
+        """清空搜索历史"""
+        self.search_history = []
+        self.save_history()
+    
+    def _highlight_text(self, text, keyword, color='#FF6B6B'):
+        """高亮显示关键词"""
+        if not keyword or not text:
+            return text
+        
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+        highlighted = pattern.sub(f'█{keyword}█', text)
+        return highlighted
+    
+    def search(self, query, exact=False, page=1, page_size=20):
+        """搜索用户
+        
+        Args:
+            query: 搜索关键词
+            exact: 是否精确匹配
+            page: 页码
+            page_size: 每页数量
+            
+        Returns:
+            搜索结果和分页信息
+        """
+        if not query or not query.strip():
+            return {
+                'results': [],
+                'total': 0,
+                'page': 1,
+                'page_size': page_size,
+                'total_pages': 0,
+                'query': ''
+            }
+        
+        query = query.strip()
+        keyword = query.lower()
+        
+        start_time = time.time()
+        
+        if exact:
+            results = [
+                user for user in self.data
+                if (keyword in user.get('uname', '').lower() or 
+                    keyword in str(user.get('uid', '')) or
+                    keyword in user.get('sign', '').lower())
+            ]
+        else:
+            keywords = keyword.split()
+            results = []
+            for user in self.data:
+                uname = user.get('uname', '').lower()
+                sign = user.get('sign', '').lower()
+                uid = str(user.get('uid', ''))
+                
+                matched = False
+                for kw in keywords:
+                    if kw in uname or kw in sign or kw in uid:
+                        matched = True
+                        break
+                
+                if matched:
+                    results.append(user)
+        
+        total = len(results)
+        total_pages = (total + page_size - 1) // page_size
+        page = min(page, max(1, total_pages))
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_results = results[start_idx:end_idx]
+        
+        elapsed = (time.time() - start_time) * 1000
+        
+        self.add_to_history(query)
+        
+        return {
+            'results': page_results,
+            'total': total,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': total_pages,
+            'query': query,
+            'elapsed': elapsed
+        }
+
 
 class BilibiliManagerGUI:
     def __init__(self, root):
@@ -26,13 +491,123 @@ class BilibiliManagerGUI:
     
         self.setup_theme()
         
+        self.data_manager = DataManager()
+        self.data_manager.register_observer('gui', self.on_data_changed)
+        
         self.api = None
         self.following_list = []
-        self.checked_items = {}  # 存储选中状态
-        self.item_data = {}      # 存储 tree item ID 到完整用户数据的映射
+        self.checked_items = {}
+        self.item_data = {}
+        
+        self.search_service = SearchService()
+        self.search_results = []
+        self.current_page = 1
+        self.page_size = 20
+        self.is_search_mode = False
+        self.search_timer = None
+        
+        self.update_status_var = tk.StringVar(value="就绪")
+        self.loading = False
         
         self.create_widgets()
+        self.setup_bindings()
         self.check_config()
+        self.auto_import_data()
+    
+    def on_data_changed(self, event: str, data: Any):
+        """数据变化回调
+        
+        Args:
+            event: 事件类型
+            data: 事件数据
+        """
+        if event == 'data_updated':
+            self.root.after(0, lambda: self.on_following_data_updated(data))
+        elif event == 'data_loading':
+            self.root.after(0, lambda: self.update_status("🔄 正在加载关注列表..."))
+        elif event == 'data_error':
+            self.root.after(0, lambda: self.update_status(f"❌ {data}"))
+        elif event == 'data_cleared':
+            self.root.after(0, lambda: self.on_data_cleared())
+    
+    def on_data_cleared(self):
+        """数据清空完成后的处理"""
+        self.following_list = []
+        self.search_service.set_data([])
+        self.update_following_list([])
+        self.update_status("✅ 所有关注已取消")
+    
+    def on_following_data_updated(self, processed_data: Dict):
+        """关注列表数据更新完成后的处理"""
+        self.following_list = self.data_manager.raw_data
+        
+        self.search_service.set_data(self.following_list)
+        
+        self.update_following_list(self.following_list)
+        
+        stats = self.data_manager.get_statistics()
+        last_update = stats['last_update']
+        if last_update:
+            try:
+                dt = datetime.fromisoformat(last_update)
+                time_str = dt.strftime('%Y-%m-%d %H:%M')
+                self.update_status(f"✅ 已加载 {stats['total_users']} 个关注用户 (更新时间: {time_str})")
+            except:
+                self.update_status(f"✅ 已加载 {stats['total_users']} 个关注用户")
+        else:
+            self.update_status("📋 已加载本地数据")
+    
+    def auto_import_data(self):
+        """自动导入本地保存的关注列表数据"""
+        if self.data_manager.processed_data:
+            stats = self.data_manager.get_statistics()
+            self.update_status(f"🔄 自动导入本地数据...")
+            self.on_following_data_updated(self.data_manager.processed_data)
+            self.update_status(f"✅ 已自动导入 {stats['total_users']} 个关注用户")
+        else:
+            self.update_status("📋 暂无本地数据，请点击「获取关注列表」按钮")
+    
+    def update_status(self, message: str):
+        """更新状态栏显示
+        
+        Args:
+            message: 状态消息
+        """
+        self.update_status_var.set(message)
+        if hasattr(self, 'status_label'):
+            pass
+    
+    def show_progress(self, show: bool, progress: float = 0, message: str = ""):
+        """显示/隐藏进度条并更新进度
+        
+        Args:
+            show: 是否显示进度条
+            progress: 进度百分比 (0-100)
+            message: 进度消息
+        """
+        if show:
+            self.progress_var.set(progress)
+            self.progress_label.config(text=message)
+            self.progress_bar.pack(side=tk.RIGHT, padx=(0, 5))
+            self.progress_label.pack(side=tk.RIGHT)
+        else:
+            self.progress_var.set(0)
+            self.progress_label.config(text="")
+            self.progress_bar.pack_forget()
+            self.progress_label.pack_forget()
+    
+    def setup_bindings(self):
+        """设置键盘快捷键"""
+        self.root.bind('<Control-f>', lambda e: self.focus_search())
+        self.root.bind('<Control-F>', lambda e: self.focus_search())
+        self.root.bind('<Escape>', lambda e: self.clear_search())
+        self.root.bind('<KeyPress-Delete>', lambda e: self.clear_search())
+        
+        self.search_entry.bind('<Return>', lambda e: self.perform_search())
+        self.search_entry.bind('<Up>', self.on_history_up)
+        self.search_entry.bind('<Down>', self.on_history_down)
+        
+        self.root.bind('<Control-l>', lambda e: self.clear_search())
     
     def setup_theme(self):
         style = ttk.Style()
@@ -142,19 +717,19 @@ class BilibiliManagerGUI:
         button_frame = tk.Frame(main_container, bg=self.colors['bg_light'])
         button_frame.pack(fill=tk.X, pady=(0, 20))
         
-        self.refresh_button = tk.Button(button_frame, text="🔄 刷新关注列表", 
-                                        command=self.refresh_following, 
-                                        state="disabled",
-                                        bg=self.colors['success'],
-                                        fg='white',
-                                        font=('Microsoft YaHei UI', 9),
-                                        relief='flat',
-                                        padx=15, pady=8,
-                                        cursor='hand2',
-                                        activebackground='#45B315',
-                                        activeforeground='white',
-                                        disabledforeground='lightgray')
-        self.refresh_button.pack(side=tk.LEFT, padx=(0, 15))
+        self.fetch_follow_button = tk.Button(button_frame, text="📥 更新关注列表", 
+                                             command=self.fetch_following_async,
+                                             state="disabled",
+                                             bg='#1890FF',
+                                             fg='white',
+                                             font=('Microsoft YaHei UI', 9),
+                                             relief='flat',
+                                             padx=15, pady=8,
+                                             cursor='hand2',
+                                             activebackground='#0969CC',
+                                             activeforeground='white',
+                                             disabledforeground='lightgray')
+        self.fetch_follow_button.pack(side=tk.LEFT, padx=(0, 15))
         
         self.batch_unfollow_button = tk.Button(button_frame, text="❌ 批量取消关注", 
                                                command=self.batch_unfollow, 
@@ -270,7 +845,152 @@ class BilibiliManagerGUI:
                                    font=("Microsoft YaHei UI", 10),
                                    fg=self.colors['text_secondary'], 
                                    bg=self.colors['bg_dark'])
-        self.count_label.pack(side=tk.RIGHT)
+        self.count_label.pack(side=tk.RIGHT, padx=(0, 10))
+        
+        # 进度条
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(list_toolbar, variable=self.progress_var, maximum=100, length=150)
+        self.progress_label = tk.Label(list_toolbar, text="", font=("Microsoft YaHei UI", 9), fg=self.colors['text_secondary'], bg=self.colors['bg_dark'])
+        
+        # 搜索区域
+        search_frame = tk.Frame(list_card, bg=self.colors['bg_dark'])
+        search_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        search_left = tk.Frame(search_frame, bg=self.colors['bg_dark'])
+        search_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        tk.Label(search_left, text="🔍 搜索:", 
+                font=("Microsoft YaHei UI", 10),
+                fg=self.colors['text_primary'],
+                bg=self.colors['bg_dark']).pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.search_entry = tk.Entry(search_left, 
+                                    font=("Microsoft YaHei UI", 10),
+                                    fg=self.colors['text_secondary'],
+                                    bg='white',
+                                    relief='flat',
+                                    bd=2,
+                                    highlightbackground=self.colors['border'],
+                                    highlightthickness=1,
+                                    width=35)
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 10))
+        self.search_entry.insert(0, "输入用户名、UID或签名...")
+        self.search_entry.bind('<FocusIn>', self.on_search_focus_in)
+        self.search_entry.bind('<FocusOut>', self.on_search_focus_out)
+        
+        self.search_button = tk.Button(search_left, text="搜索",
+                                       command=self.perform_search,
+                                       bg=self.colors['primary'],
+                                       fg='white',
+                                       font=('Microsoft YaHei UI', 9),
+                                       relief='flat',
+                                       padx=15, pady=4,
+                                       cursor='hand2',
+                                       activebackground=self.colors['primary_dark'])
+        self.search_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.clear_search_button = tk.Button(search_left, text="清除",
+                                              command=self.clear_search,
+                                              bg='#F0F0F0',
+                                              fg=self.colors['text_primary'],
+                                              font=('Microsoft YaHei UI', 9),
+                                              relief='flat',
+                                              padx=12, pady=4,
+                                              cursor='hand2',
+                                              activebackground='#E0E0E0')
+        self.clear_search_button.pack(side=tk.LEFT)
+        
+        # 搜索选项
+        search_options = tk.Frame(search_frame, bg=self.colors['bg_dark'])
+        search_options.pack(fill=tk.X, pady=(10, 0))
+        
+        tk.Label(search_options, text="匹配模式:", 
+                font=("Microsoft YaHei UI", 9),
+                fg=self.colors['text_secondary'],
+                bg=self.colors['bg_dark']).pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.match_mode = tk.StringVar(value="fuzzy")
+        fuzzy_radio = tk.Radiobutton(search_options, text="模糊匹配", 
+                                    variable=self.match_mode, value="fuzzy",
+                                    font=("Microsoft YaHei UI", 9),
+                                    fg=self.colors['text_primary'],
+                                    bg=self.colors['bg_dark'],
+                                    activebackground=self.colors['bg_dark'],
+                                    selectcolor=self.colors['bg_dark'],
+                                    command=self.perform_search)
+        fuzzy_radio.pack(side=tk.LEFT, padx=(0, 15))
+        
+        exact_radio = tk.Radiobutton(search_options, text="精确匹配", 
+                                    variable=self.match_mode, value="exact",
+                                    font=("Microsoft YaHei UI", 9),
+                                    fg=self.colors['text_primary'],
+                                    bg=self.colors['bg_dark'],
+                                    activebackground=self.colors['bg_dark'],
+                                    selectcolor=self.colors['bg_dark'],
+                                    command=self.perform_search)
+        exact_radio.pack(side=tk.LEFT, padx=(0, 15))
+        
+        self.search_result_label = tk.Label(search_options, text="", 
+                                           font=("Microsoft YaHei UI", 9),
+                                           fg=self.colors['primary'],
+                                           bg=self.colors['bg_dark'])
+        self.search_result_label.pack(side=tk.RIGHT)
+        
+        # 分页控制
+        pagination_frame = tk.Frame(search_frame, bg=self.colors['bg_dark'])
+        pagination_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        tk.Label(pagination_frame, text="每页显示:", 
+                font=("Microsoft YaHei UI", 9),
+                fg=self.colors['text_secondary'],
+                bg=self.colors['bg_dark']).pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.page_size_var = tk.IntVar(value=20)
+        page_sizes = [10, 20, 50, 100]
+        self.page_size_combo = ttk.Combobox(pagination_frame, 
+                                            textvariable=self.page_size_var,
+                                            values=page_sizes,
+                                            width=5,
+                                            state="readonly")
+        self.page_size_combo.pack(side=tk.LEFT, padx=(0, 15))
+        self.page_size_combo.bind('<<ComboboxSelected>>', self.on_page_size_change)
+        
+        self.prev_page_button = tk.Button(pagination_frame, text="◀ 上一页",
+                                          command=self.prev_page,
+                                          state="disabled",
+                                          bg='#F0F0F0',
+                                          fg=self.colors['text_primary'],
+                                          font=('Microsoft YaHei UI', 9),
+                                          relief='flat',
+                                          padx=10, pady=3,
+                                          cursor='hand2',
+                                          activebackground='#E0E0E0')
+        self.prev_page_button.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.page_label = tk.Label(pagination_frame, text="第 1 / 1 页",
+                                  font=("Microsoft YaHei UI", 9),
+                                  fg=self.colors['text_primary'],
+                                  bg=self.colors['bg_dark'])
+        self.page_label.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.next_page_button = tk.Button(pagination_frame, text="下一页 ▶",
+                                          command=self.next_page,
+                                          state="disabled",
+                                          bg='#F0F0F0',
+                                          fg=self.colors['text_primary'],
+                                          font=('Microsoft YaHei UI', 9),
+                                          relief='flat',
+                                          padx=10, pady=3,
+                                          cursor='hand2',
+                                          activebackground='#E0E0E0')
+        self.next_page_button.pack(side=tk.LEFT, padx=(0, 15))
+        
+        # 快捷键提示
+        shortcut_text = "💡 快捷键: Ctrl+F 搜索 | Enter 确认 | Esc 清除 | Ctrl+L 清空"
+        tk.Label(pagination_frame, text=shortcut_text,
+                font=("Microsoft YaHei UI", 8),
+                fg=self.colors['text_secondary'],
+                bg=self.colors['bg_dark']).pack(side=tk.RIGHT)
         
         # 创建表格容器
         table_frame = tk.Frame(list_card, bg=self.colors['bg_dark'])
@@ -310,7 +1030,7 @@ class BilibiliManagerGUI:
         status_frame.pack(fill=tk.X, pady=(15, 0))
         status_frame.pack_propagate(False)
         
-        self.status_bar = tk.Label(status_frame, text="🎯 准备就绪", 
+        self.status_bar = tk.Label(status_frame, textvariable=self.update_status_var, 
                                   font=("Microsoft YaHei UI", 10),
                                   fg=self.colors['text_secondary'],
                                   bg=self.colors['bg_light'], anchor=tk.W)
@@ -354,12 +1074,18 @@ class BilibiliManagerGUI:
                     self.root.after(0, self.login_success)
                 else:
                     self.root.after(0, self.login_failed)
-            except Exception:
-                self.root.after(0, self.login_failed)
+            except Exception as e:
+                error_msg = str(e)
+                self.root.after(0, lambda: self.show_login_error(error_msg))
         
         thread = threading.Thread(target=login_thread)
         thread.daemon = True
         thread.start()
+    
+    def show_login_error(self, error_msg):
+        self.login_button.config(state="normal")
+        messagebox.showerror("❌ 登录失败", f"设置登录时出错：\n\n{error_msg}\n\n请检查：\n1. Chrome浏览器是否已安装\n2. 网络连接是否正常\n3. 是否有防火墙阻止Chrome启动")
+        self.update_status("❌ 登录设置失败")
     
     def logout(self):
         """退出登录，删除配置文件"""
@@ -385,7 +1111,7 @@ class BilibiliManagerGUI:
             self.login_button.config(text="🔐 设置登录", command=self.setup_login, bg=self.colors['primary'])
             
             # 禁用所有功能按钮
-            self.refresh_button.config(state="disabled")
+            self.fetch_follow_button.config(state="disabled")
             self.batch_unfollow_button.config(state="disabled")
             self.export_button.config(state="disabled")
             self.import_follow_button.config(state="disabled")
@@ -419,7 +1145,7 @@ class BilibiliManagerGUI:
         self.update_status("❌ 登录设置失败")
     
     def enable_buttons(self):
-        self.refresh_button.config(state="normal")
+        self.fetch_follow_button.config(state="normal")
         self.batch_unfollow_button.config(state="normal")
         self.export_button.config(state="normal")
         self.import_follow_button.config(state="normal")
@@ -428,24 +1154,83 @@ class BilibiliManagerGUI:
         self.batch_check_button.config(state="normal")
         self.batch_uncheck_button.config(state="normal")
     
-    def refresh_following(self):
-        def refresh_thread():
-            self.root.after(0, lambda: self.refresh_button.config(state="disabled"))
+    def fetch_following_async(self):
+        """异步获取关注列表 - 手动更新功能
+        
+        此方法在独立线程中执行，避免阻塞主界面
+        获取完成后自动处理数据并通知所有观察者
+        """
+        def fetch_thread():
+            if self.loading:
+                self.root.after(0, lambda: messagebox.showwarning("⚠️ 提示", "数据正在加载中，请稍候..."))
+                return
+            
+            self.loading = True
+            self.root.after(0, lambda: self.fetch_follow_button.config(state="disabled"))
             self.root.after(0, lambda: self.update_status("🔄 正在获取关注列表..."))
+            self.data_manager.notify_observers('data_loading', '正在从服务器获取关注列表...')
             
             try:
                 if self.api is None:
-                    self.root.after(0, lambda: messagebox.showerror("❌ 错误", "请先登录以获取关注列表"))
-                    self.root.after(0, self.refresh_failed)
+                    error_msg = "请先登录以获取关注列表"
+                    self.root.after(0, lambda: messagebox.showerror("❌ 错误", error_msg))
+                    self.root.after(0, self.fetch_failed)
+                    self.data_manager.notify_observers('data_error', error_msg)
                     return
+                
                 following_list = self.api.get_all_following()
-                self.root.after(0, lambda: self.update_following_list(following_list))
-            except Exception:
-                self.root.after(0, self.refresh_failed)
+                
+                if not following_list:
+                    self.root.after(0, lambda: messagebox.showwarning("⚠️ 提示", "关注列表为空或获取失败"))
+                    self.root.after(0, self.fetch_completed)
+                    return
+                
+                processed_data = self.data_manager.process_data(following_list)
+                
+                save_success = self.data_manager.save_data(processed_data)
+                if save_success:
+                    self.data_manager.processed_data = processed_data
+                    self.data_manager.raw_data = following_list
+                    self.data_manager.last_update = processed_data.get('update_time', '')
+                    self.data_manager.update_count = processed_data.get('total_count', 0)
+                    
+                    self.root.after(0, self.fetch_success)
+                    self.data_manager.notify_observers('data_updated', processed_data)
+                else:
+                    error_msg = "数据保存失败"
+                    self.root.after(0, lambda: messagebox.showerror("❌ 错误", error_msg))
+                    self.root.after(0, self.fetch_failed)
+                    self.data_manager.notify_observers('data_error', error_msg)
+                    
+            except Exception as e:
+                error_msg = f"获取关注列表失败：{str(e)}"
+                self.root.after(0, lambda: messagebox.showerror("❌ 错误", error_msg))
+                self.root.after(0, self.fetch_failed)
+                self.data_manager.notify_observers('data_error', error_msg)
+            finally:
+                self.loading = False
         
-        thread = threading.Thread(target=refresh_thread)
+        thread = threading.Thread(target=fetch_thread)
         thread.daemon = True
         thread.start()
+    
+    def fetch_success(self):
+        """获取成功回调"""
+        self.fetch_follow_button.config(state="normal")
+        stats = self.data_manager.get_statistics()
+        count = stats['total_users']
+        self.update_status(f"✅ 成功获取 {count} 个关注用户")
+        messagebox.showinfo("🎉 完成", f"成功获取 {count} 个关注用户！\n\n数据已自动保存到本地。")
+    
+    def fetch_failed(self):
+        """获取失败回调"""
+        self.fetch_follow_button.config(state="normal")
+        self.update_status("❌ 获取关注列表失败")
+    
+    def fetch_completed(self):
+        """获取完成回调（无数据）"""
+        self.fetch_follow_button.config(state="normal")
+        self.update_status("📋 关注列表为空")
     
     def update_following_list(self, following_list):
         for item in self.tree.get_children():
@@ -467,21 +1252,16 @@ class BilibiliManagerGUI:
             # 插入时设置默认为未选中
             item_id = self.tree.insert("", tk.END, text="☐", values=(
                 user.get('uname', '未知'),
-                user.get('mid', ''),
+                user.get('uid', ''),
                 mtime_str,
                 sign
             ))
             self.checked_items[item_id] = False
             self.item_data[item_id] = user  # 保存完整的用户数据
         
-        self.refresh_button.config(state="normal")
+        self.fetch_follow_button.config(state="normal")
         self.count_label.config(text=f"共 {len(following_list)} 个关注")
         self.update_status(f"✅ 已加载 {len(following_list)} 个关注用户")
-    
-    def refresh_failed(self):
-        self.refresh_button.config(state="normal")
-        messagebox.showerror("❌ 错误", "获取关注列表失败")
-        self.update_status("❌ 获取关注列表失败")
     
     def select_all(self):
         for item in self.tree.get_children():
@@ -531,6 +1311,8 @@ class BilibiliManagerGUI:
     
     def batch_unfollow(self):
         selected_items = [item for item, checked in self.checked_items.items() if checked]
+        print(f"[DEBUG] 批量取消关注: checked_items数量={len(self.checked_items)}, 选中数量={len(selected_items)}")
+        
         if not selected_items:
             messagebox.showwarning("⚠️ 警告", "请先选择要取消关注的用户")
             return
@@ -543,34 +1325,93 @@ class BilibiliManagerGUI:
         
         def unfollow_thread():
             self.root.after(0, lambda: self.batch_unfollow_button.config(state="disabled"))
+            self.root.after(0, lambda: self.show_progress(True, 0, f"准备取消关注 {count} 个用户..."))
             
             success_count = 0
-            for item in selected_items:
+            failed_count = 0
+            removed_items = []
+            
+            for idx, item in enumerate(selected_items):
                 try:
                     values = self.tree.item(item)['values']
-                    uid = int(values[1])
+                    uid_str = values[1]
+                    
+                    if not uid_str or uid_str == '':
+                        print(f"[WARN] 用户 {values[0]} 的UID为空，跳过")
+                        failed_count += 1
+                        continue
+                    
+                    uid = int(uid_str)
                     username = values[0]
                     
-                    self.root.after(0, lambda u=username: self.update_status(f"🔄 正在取消关注: {u}"))
+                    progress_pct = (idx + 1) / count * 100
+                    self.root.after(0, lambda p=progress_pct, u=username, c=idx+1, t=count: 
+                                  self.show_progress(True, p, f"🔄 取消关注 ({c}/{t}): {u}"))
                     
                     if self.api and hasattr(self.api, "unfollow_user") and callable(getattr(self.api, "unfollow_user")):
                         if self.api.unfollow_user(uid):
                             success_count += 1
-                            self.root.after(0, lambda i=item: self.tree.delete(i))
+                            removed_items.append(item)
+                        else:
+                            failed_count += 1
+                            print(f"[WARN] 取消关注失败: {username} (UID: {uid})")
                     else:
-                        raise AttributeError("API对象未实现unfollow_user方法")
+                        failed_count += 1
+                        print("[ERROR] API对象未实现unfollow_user方法")
                 
-                except Exception:
-                    continue
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[ERROR] 取消关注异常: {str(e)}")
             
             self.root.after(0, lambda: self.batch_unfollow_button.config(state="normal"))
-            self.root.after(0, lambda: self.count_label.config(text=f"共 {len(self.tree.get_children())} 个关注"))
-            self.root.after(0, lambda: self.update_status(f"✅ 完成！成功取消关注 {success_count} 个用户"))
-            self.root.after(0, lambda: messagebox.showinfo("🎉 完成", f"成功取消关注 {success_count} 个用户"))
+            self.root.after(0, lambda: self.show_progress(False))
+
+            if removed_items:
+                remaining_users = []
+                for item in self.item_data.keys():
+                    if item not in removed_items:
+                        user_data = self.item_data.get(item, {})
+                        if user_data:
+                            remaining_users.append(user_data)
+                
+                remaining_count = len(remaining_users)
+                
+                for item in removed_items:
+                    current_item = item
+                    self.root.after(0, lambda i=current_item: self.tree.delete(i))
+                    self.root.after(0, lambda i=current_item: self.checked_items.pop(i, None))
+                    self.root.after(0, lambda i=current_item: self.item_data.pop(i, None))
+
+                self.root.after(0, lambda c=remaining_count: self.count_label.config(text=f"共 {c} 个关注"))
+
+                if remaining_users:
+                    self.root.after(0, lambda r=remaining_users: self.save_remaining_users(r))
+                    self.root.after(0, lambda s=success_count, f=failed_count, c=remaining_count: 
+                                  (self.update_status(f"✅ 完成！成功取消关注 {s} 个用户，失败 {f} 个，剩余 {c} 个"),
+                                   self.update_following_list_local(r)))
+                else:
+                    self.root.after(0, lambda: self.data_manager.clear_data())
+                    self.root.after(0, lambda: self.update_following_list([]))
+                    self.root.after(0, lambda: self.update_status("✅ 所有关注已取消"))
+            else:
+                self.root.after(0, lambda: self.update_status(f"⚠️ 取关完成，但部分用户可能已在服务器端取消关注"))
+
+            self.root.after(0, lambda s=success_count, f=failed_count: messagebox.showinfo("🎉 完成", f"成功取消关注 {s} 个用户\n失败 {f} 个用户"))
         
         thread = threading.Thread(target=unfollow_thread)
         thread.daemon = True
         thread.start()
+
+    def save_remaining_users(self, remaining_users: list):
+        """保存剩余用户数据（用于批量取关后同步）"""
+        if remaining_users:
+            self.data_manager.save_following_list(remaining_users)
+            self.data_manager.raw_data = remaining_users
+    
+    def update_following_list_local(self, following_list: list):
+        """本地更新关注列表（不重新从文件加载）"""
+        self.following_list = following_list
+        self.search_service.set_data(following_list)
     
     def export_list(self):
         selected_items = [item for item, checked in self.checked_items.items() if checked]
@@ -957,7 +1798,7 @@ class BilibiliManagerGUI:
             
             # 刷新关注列表
             if success_count > 0:
-                self.root.after(2000, self.refresh_following)  # 2秒后自动刷新
+                self.root.after(2000, self.fetch_following_async)  # 2秒后自动刷新
         
         thread = threading.Thread(target=follow_thread)
         thread.daemon = True
@@ -1019,6 +1860,184 @@ Copyright © 2025 一懒众衫小 (Noeky)
             self.tree.item(item, text="☐")
             # 如果取消选中，从 selection 中移除
             self.tree.selection_remove(item)
+    
+    def on_search_focus_in(self, event):
+        """搜索框获得焦点"""
+        if self.search_entry.get() == "输入用户名、UID或签名...":
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.config(fg=self.colors['text_primary'])
+    
+    def on_search_focus_out(self, event):
+        """搜索框失去焦点"""
+        if not self.search_entry.get().strip():
+            self.search_entry.insert(0, "输入用户名、UID或签名...")
+            self.search_entry.config(fg=self.colors['text_secondary'])
+    
+    def perform_search(self):
+        """执行搜索"""
+        query = self.search_entry.get().strip()
+        
+        if query == "输入用户名、UID或签名...":
+            query = ""
+        
+        if not query:
+            self.clear_search()
+            return
+        
+        self.current_page = 1
+        self.is_search_mode = True
+        
+        exact = (self.match_mode.get() == "exact")
+        
+        self.search_service.set_data(self.following_list)
+        result = self.search_service.search(query, exact=exact, page=self.current_page, page_size=self.page_size)
+        
+        self.search_results = result['results']
+        
+        self.update_search_results(result)
+        
+        self.update_status(f"🔍 搜索完成: 找到 {result['total']} 个匹配结果 (耗时 {result['elapsed']:.1f}ms)")
+    
+    def update_search_results(self, result):
+        """更新搜索结果展示"""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        results = result['results']
+        query = result.get('query', '').lower()
+        
+        for user in results:
+            uname = user.get('uname', '未知')
+            uid = user.get('uid', '') or user.get('mid', '')
+            mtime_str = user.get('mtime_str', '未知')
+            sign = user.get('sign', '').strip()
+            if not sign:
+                sign = '暂无签名'
+            
+            item_id = self.tree.insert("", tk.END, text="☐", values=(
+                uname,
+                uid,
+                mtime_str,
+                sign
+            ))
+            self.checked_items[item_id] = False
+            self.item_data[item_id] = user
+        
+        self.count_label.config(text=f"搜索结果: {result['total']} 个 (第 {result['page']}/{result['total_pages']} 页)")
+        
+        self.page_label.config(text=f"第 {result['page']} / {result['total_pages']} 页")
+        
+        self.prev_page_button.config(state="normal" if result['page'] > 1 else "disabled")
+        self.next_page_button.config(state="normal" if result['page'] < result['total_pages'] else "disabled")
+        
+        self.search_result_label.config(text=f"找到 {result['total']} 个结果")
+    
+    def clear_search(self):
+        """清除搜索状态，恢复显示所有关注列表"""
+        self.is_search_mode = False
+        self.search_results = []
+        self.search_entry.delete(0, tk.END)
+        self.search_entry.insert(0, "输入用户名、UID或签名...")
+        self.search_entry.config(fg=self.colors['text_secondary'])
+        
+        self.current_page = 1
+        self.search_result_label.config(text="")
+        
+        self.update_following_list(self.following_list)
+        
+        self.prev_page_button.config(state="disabled")
+        self.next_page_button.config(state="disabled")
+        self.page_label.config(text="第 1 / 1 页")
+        
+        self.update_status("🔍 搜索已清除，显示所有关注")
+    
+    def focus_search(self):
+        """聚焦到搜索框"""
+        self.search_entry.focus_set()
+        if self.search_entry.get() == "输入用户名、UID或签名...":
+            self.search_entry.select_range(0, tk.END)
+    
+    history_index = -1
+    
+    def on_history_up(self, event):
+        """历史记录向上导航"""
+        if not hasattr(self, 'history_index'):
+            self.history_index = -1
+        
+        history = self.search_service.get_history()
+        if not history:
+            return
+        
+        self.history_index = min(self.history_index + 1, len(history) - 1)
+        
+        if self.history_index >= 0:
+            query = history[self.history_index]
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.insert(0, query)
+            self.search_entry.config(fg=self.colors['text_primary'])
+    
+    def on_history_down(self, event):
+        """历史记录向下导航"""
+        if not hasattr(self, 'history_index'):
+            self.history_index = -1
+        
+        history = self.search_service.get_history()
+        if not history:
+            return
+        
+        self.history_index = max(self.history_index - 1, -1)
+        
+        if self.history_index >= 0:
+            query = history[self.history_index]
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.insert(0, query)
+            self.search_entry.config(fg=self.colors['text_primary'])
+        else:
+            self.search_entry.delete(0, tk.END)
+            self.search_entry.insert(0, "输入用户名、UID或签名...")
+            self.search_entry.config(fg=self.colors['text_secondary'])
+    
+    def prev_page(self):
+        """上一页"""
+        if self.current_page > 1:
+            self.current_page -= 1
+            self.execute_paged_search()
+    
+    def next_page(self):
+        """下一页"""
+        if self.is_search_mode and self.search_results:
+            total = len(self.search_results) + (self.current_page - 1) * self.page_size
+            if self.current_page * self.page_size < len(self.following_list) + 1000:
+                self.current_page += 1
+                self.execute_paged_search()
+    
+    def execute_paged_search(self):
+        """执行分页搜索"""
+        query = self.search_entry.get().strip()
+        if query == "输入用户名、UID或签名...":
+            query = ""
+        
+        if not query:
+            return
+        
+        exact = (self.match_mode.get() == "exact")
+        
+        result = self.search_service.search(query, exact=exact, page=self.current_page, page_size=self.page_size)
+        self.search_results = result['results']
+        
+        self.update_search_results(result)
+        
+        self.update_status(f"🔍 搜索: 第 {self.current_page} 页 (共 {result['total']} 个结果)")
+    
+    def on_page_size_change(self, event):
+        """每页数量变化"""
+        self.page_size = self.page_size_var.get()
+        self.current_page = 1
+        
+        if self.is_search_mode:
+            self.execute_paged_search()
+        else:
+            self.update_following_list(self.following_list)
 
 def main():
     root = tk.Tk()
